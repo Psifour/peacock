@@ -77,8 +77,9 @@ public class PSBT {
             input.setWitness(null);
         }
 
+        // TODO: Implement robust logic for toggling this feature
         //Shuffle outputs so change outputs are less obvious
-        transaction.shuffleOutputs();
+        //transaction.shuffleOutputs();
 
         if(includeGlobalXpubs) {
             for(Keystore keystore : walletTransaction.getWallet().getKeystores()) {
