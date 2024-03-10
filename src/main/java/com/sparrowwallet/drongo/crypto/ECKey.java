@@ -308,6 +308,13 @@ public class ECKey {
     }
 
     /**
+     * Gets the raw public key value in compressed or uncompressed form.
+     */
+    public byte[] getPubKey(boolean compressed) {
+        return pub.getEncoded(compressed);
+    }
+
+    /**
      * Gets the x coordinate of the raw public key value. This appears in transaction scriptPubKeys for Taproot outputs.
      */
     public byte[] getPubKeyXCoord() {
@@ -545,7 +552,7 @@ public class ECKey {
                 throw new IllegalArgumentException("Input has 'publicKey' with bad tag number");
             }
 
-            byte[] pubbits = ((DERBitString)pubkey.getObject()).getBytes();
+            byte[] pubbits = ((DERBitString)pubkey.getBaseObject()).getBytes();
             if(pubbits.length != 33 && pubbits.length != 65) {
                 throw new IllegalArgumentException("Input has 'publicKey' with invalid length");
             };

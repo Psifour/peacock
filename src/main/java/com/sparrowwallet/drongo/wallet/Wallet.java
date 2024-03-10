@@ -24,7 +24,9 @@ import static com.sparrowwallet.drongo.protocol.Transaction.WITNESS_SCALE_FACTOR
 
 public class Wallet extends Persistable implements Comparable<Wallet> {
     public static final int DEFAULT_LOOKAHEAD = 20;
+    public static final int SEARCH_LOOKAHEAD = 4000;
     public static final String ALLOW_DERIVATIONS_MATCHING_OTHER_SCRIPT_TYPES_PROPERTY = "com.sparrowwallet.allowDerivationsMatchingOtherScriptTypes";
+    public static final String ALLOW_DERIVATIONS_MATCHING_OTHER_NETWORKS_PROPERTY = "com.sparrowwallet.allowDerivationsMatchingOtherNetworks";
 
     private String name;
     private String label;
@@ -357,11 +359,11 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
     }
 
     public boolean isWhirlpoolChildWallet() {
-        return !isMasterWallet() && getStandardAccountType() != null && StandardAccount.WHIRLPOOL_ACCOUNTS.contains(getStandardAccountType());
+        return !isMasterWallet() && getStandardAccountType() != null && StandardAccount.isWhirlpoolAccount(getStandardAccountType());
     }
 
     public boolean isWhirlpoolMixWallet() {
-        return !isMasterWallet() && StandardAccount.WHIRLPOOL_MIX_ACCOUNTS.contains(getStandardAccountType());
+        return !isMasterWallet() && getMasterWallet().isWhirlpoolMasterWallet() && StandardAccount.isWhirlpoolMixAccount(getStandardAccountType());
     }
 
     public void setName(String name) {
@@ -799,30 +801,38 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
     }
 
     public Map<BlockTransactionHashIndex, WalletNode> getWalletUtxos() {
-        return getWalletUtxos(false);
+        return getWalletTxos(List.of(new SpentTxoFilter()));
     }
 
-    public Map<BlockTransactionHashIndex, WalletNode> getWalletUtxos(boolean includeSpentMempoolOutputs) {
-        Map<BlockTransactionHashIndex, WalletNode> walletUtxos = new TreeMap<>();
+    public Map<BlockTransactionHashIndex, WalletNode> getSpendableUtxos() {
+        return getWalletTxos(List.of(new SpentTxoFilter(), new FrozenTxoFilter(), new CoinbaseTxoFilter(this)));
+    }
+
+    public Map<BlockTransactionHashIndex, WalletNode> getSpendableUtxos(BlockTransaction replacedTransaction) {
+        return getWalletTxos(List.of(new SpentTxoFilter(replacedTransaction == null ? null : replacedTransaction.getHash()), new FrozenTxoFilter(), new CoinbaseTxoFilter(this)));
+    }
+
+    public Map<BlockTransactionHashIndex, WalletNode> getWalletTxos(Collection<TxoFilter> txoFilters) {
+        Map<BlockTransactionHashIndex, WalletNode> walletTxos = new TreeMap<>();
         for(KeyPurpose keyPurpose : getWalletKeyPurposes()) {
-            getWalletUtxos(walletUtxos, getNode(keyPurpose), includeSpentMempoolOutputs);
+            getWalletTxos(walletTxos, getNode(keyPurpose), txoFilters);
         }
 
         for(Wallet childWallet : getChildWallets()) {
             if(childWallet.isNested()) {
                 for(KeyPurpose keyPurpose : childWallet.getWalletKeyPurposes()) {
-                    getWalletUtxos(walletUtxos, childWallet.getNode(keyPurpose), includeSpentMempoolOutputs);
+                    getWalletTxos(walletTxos, childWallet.getNode(keyPurpose), txoFilters);
                 }
             }
         }
 
-        return walletUtxos;
+        return walletTxos;
     }
 
-    private void getWalletUtxos(Map<BlockTransactionHashIndex, WalletNode> walletUtxos, WalletNode purposeNode, boolean includeSpentMempoolOutputs) {
+    private void getWalletTxos(Map<BlockTransactionHashIndex, WalletNode> walletTxos, WalletNode purposeNode, Collection<TxoFilter> txoFilters) {
         for(WalletNode addressNode : purposeNode.getChildren()) {
-            for(BlockTransactionHashIndex utxo : addressNode.getUnspentTransactionOutputs(includeSpentMempoolOutputs)) {
-                walletUtxos.put(utxo, addressNode);
+            for(BlockTransactionHashIndex utxo : addressNode.getTransactionOutputs(txoFilters)) {
+                walletTxos.put(utxo, addressNode);
             }
         }
     }
@@ -981,29 +991,30 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
         return getFee(changeOutput, feeRate, longTermFeeRate);
     }
 
-    public WalletTransaction createWalletTransaction(List<UtxoSelector> utxoSelectors, List<UtxoFilter> utxoFilters, List<Payment> payments, List<byte[]> opReturns, Set<WalletNode> excludedChangeNodes, double feeRate, double longTermFeeRate, Long fee, Integer currentBlockHeight, boolean groupByAddress, boolean includeMempoolOutputs, boolean includeSpentMempoolOutputs) throws InsufficientFundsException {
+    public WalletTransaction createWalletTransaction(List<UtxoSelector> utxoSelectors, List<TxoFilter> txoFilters, List<Payment> payments, List<byte[]> opReturns, Set<WalletNode> excludedChangeNodes, double feeRate, double longTermFeeRate, Long fee, Integer currentBlockHeight, boolean groupByAddress, boolean includeMempoolOutputs) throws InsufficientFundsException {
         boolean sendMax = payments.stream().anyMatch(Payment::isSendMax);
         long totalPaymentAmount = payments.stream().map(Payment::getAmount).mapToLong(v -> v).sum();
-        long totalUtxoValue = getWalletUtxos().keySet().stream().mapToLong(BlockTransactionHashIndex::getValue).sum();
+        Map<BlockTransactionHashIndex, WalletNode> availableTxos = getWalletTxos(txoFilters);
+        long totalAvailableValue = availableTxos.keySet().stream().mapToLong(BlockTransactionHashIndex::getValue).sum();
 
         if(fee != null && feeRate != Transaction.DEFAULT_MIN_RELAY_FEE) {
             throw new IllegalArgumentException("Use an input fee rate of 1 sat/vB when using a defined fee amount so UTXO selectors overestimate effective value");
         }
 
-        long maxSpendableAmt = getMaxSpendable(payments.stream().map(Payment::getAddress).collect(Collectors.toList()), feeRate, includeSpentMempoolOutputs);
+        long maxSpendableAmt = getMaxSpendable(payments.stream().map(Payment::getAddress).collect(Collectors.toList()), feeRate, availableTxos);
         if(maxSpendableAmt < 0) {
             throw new InsufficientFundsException("Not enough combined value in all available UTXOs to send a transaction to the provided addresses at this fee rate");
         }
 
         //When a user fee is set, we can calculate the fees to spend all UTXOs because we assume all UTXOs are spendable at a fee rate of 1 sat/vB
         //We can then add the user set fee less this amount as a "phantom payment amount" to the value required to find (which cannot include transaction fees)
-        long valueRequiredAmt = totalPaymentAmount + (fee != null ? fee - (totalUtxoValue - maxSpendableAmt) : 0);
+        long valueRequiredAmt = totalPaymentAmount + (fee != null ? fee - (totalAvailableValue - maxSpendableAmt) : 0);
         if(maxSpendableAmt < valueRequiredAmt) {
             throw new InsufficientFundsException("Not enough combined value in all available UTXOs to send a transaction to send the provided payments at the user set fee" + (fee == null ? " rate" : ""));
         }
 
         while(true) {
-            List<Map<BlockTransactionHashIndex, WalletNode>> selectedUtxoSets = selectInputSets(utxoSelectors, utxoFilters, valueRequiredAmt, feeRate, longTermFeeRate, groupByAddress, includeMempoolOutputs, includeSpentMempoolOutputs, sendMax);
+            List<Map<BlockTransactionHashIndex, WalletNode>> selectedUtxoSets = selectInputSets(availableTxos, utxoSelectors, txoFilters, valueRequiredAmt, feeRate, longTermFeeRate, groupByAddress, includeMempoolOutputs, sendMax);
             Map<BlockTransactionHashIndex, WalletNode> selectedUtxos = new LinkedHashMap<>();
             selectedUtxoSets.forEach(selectedUtxos::putAll);
             long totalSelectedAmt = selectedUtxos.keySet().stream().mapToLong(BlockTransactionHashIndex::getValue).sum();
@@ -1076,8 +1087,8 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
             if(differenceAmt < noChangeFeeRequiredAmt) {
                 valueRequiredAmt = totalSelectedAmt + 1;
                 //If we haven't selected all UTXOs yet, don't require more than the max spendable amount
-                if(valueRequiredAmt > maxSpendableAmt && transaction.getInputs().size() < getWalletUtxos().size()) {
-                    valueRequiredAmt =  maxSpendableAmt;
+                if(valueRequiredAmt > maxSpendableAmt && transaction.getInputs().size() < availableTxos.size()) {
+                    valueRequiredAmt = maxSpendableAmt;
                 }
 
                 continue;
@@ -1180,8 +1191,8 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
         }
     }
 
-    private List<Map<BlockTransactionHashIndex, WalletNode>> selectInputSets(List<UtxoSelector> utxoSelectors, List<UtxoFilter> utxoFilters, Long targetValue, double feeRate, double longTermFeeRate, boolean groupByAddress, boolean includeMempoolOutputs, boolean includeSpentMempoolOutputs, boolean sendMax) throws InsufficientFundsException {
-        List<OutputGroup> utxoPool = getGroupedUtxos(utxoFilters, feeRate, longTermFeeRate, groupByAddress, includeSpentMempoolOutputs);
+    private List<Map<BlockTransactionHashIndex, WalletNode>> selectInputSets(Map<BlockTransactionHashIndex, WalletNode> availableTxos, List<UtxoSelector> utxoSelectors, List<TxoFilter> txoFilters, Long targetValue, double feeRate, double longTermFeeRate, boolean groupByAddress, boolean includeMempoolOutputs, boolean sendMax) throws InsufficientFundsException {
+        List<OutputGroup> utxoPool = getGroupedUtxos(txoFilters, feeRate, longTermFeeRate, groupByAddress);
 
         List<OutputGroup.Filter> filters = new ArrayList<>();
         filters.add(new OutputGroup.Filter(1, 6, false));
@@ -1204,7 +1215,6 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
                 List<Collection<BlockTransactionHashIndex>> selectedInputSets = utxoSelector.selectSets(targetValue, filteredPool);
                 List<Map<BlockTransactionHashIndex, WalletNode>> selectedInputSetsList = new ArrayList<>();
                 long total = 0;
-                Map<BlockTransactionHashIndex, WalletNode> utxos = getWalletUtxos(includeSpentMempoolOutputs);
                 for(Collection<BlockTransactionHashIndex> selectedInputs : selectedInputSets) {
                     total += selectedInputs.stream().mapToLong(BlockTransactionHashIndex::getValue).sum();
                     Map<BlockTransactionHashIndex, WalletNode> selectedInputsMap = new LinkedHashMap<>();
@@ -1213,7 +1223,7 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
                         Collections.shuffle(shuffledInputs);
                     }
                     for(BlockTransactionHashIndex shuffledInput : shuffledInputs) {
-                        selectedInputsMap.put(shuffledInput, utxos.get(shuffledInput));
+                        selectedInputsMap.put(shuffledInput, availableTxos.get(shuffledInput));
                     }
                     selectedInputSetsList.add(selectedInputsMap);
                 }
@@ -1224,21 +1234,21 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
             }
         }
 
-        throw new InsufficientFundsException("Not enough combined value in UTXOs for output value " + targetValue);
+        throw new InsufficientFundsException("Not enough combined value in UTXOs for output value " + targetValue, targetValue);
     }
 
-    private List<OutputGroup> getGroupedUtxos(List<UtxoFilter> utxoFilters, double feeRate, double longTermFeeRate, boolean groupByAddress, boolean includeSpentMempoolOutputs) {
+    public List<OutputGroup> getGroupedUtxos(List<TxoFilter> txoFilters, double feeRate, double longTermFeeRate, boolean groupByAddress) {
         List<OutputGroup> outputGroups = new ArrayList<>();
         Map<Sha256Hash, BlockTransaction> walletTransactions = getWalletTransactions();
         Map<BlockTransactionHashIndex, WalletNode> walletTxos = getWalletTxos();
         for(KeyPurpose keyPurpose : getWalletKeyPurposes()) {
-            getGroupedUtxos(outputGroups, getNode(keyPurpose), utxoFilters, walletTransactions, walletTxos, feeRate, longTermFeeRate, groupByAddress, includeSpentMempoolOutputs);
+            getGroupedUtxos(outputGroups, getNode(keyPurpose), txoFilters, walletTransactions, walletTxos, feeRate, longTermFeeRate, groupByAddress);
         }
 
         for(Wallet childWallet : getChildWallets()) {
             if(childWallet.isNested()) {
                 for(KeyPurpose keyPurpose : childWallet.getWalletKeyPurposes()) {
-                    childWallet.getGroupedUtxos(outputGroups, childWallet.getNode(keyPurpose), utxoFilters, walletTransactions, walletTxos, feeRate, longTermFeeRate, groupByAddress, includeSpentMempoolOutputs);
+                    childWallet.getGroupedUtxos(outputGroups, childWallet.getNode(keyPurpose), txoFilters, walletTransactions, walletTxos, feeRate, longTermFeeRate, groupByAddress);
                 }
             }
         }
@@ -1246,16 +1256,11 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
         return outputGroups;
     }
 
-    private void getGroupedUtxos(List<OutputGroup> outputGroups, WalletNode purposeNode, List<UtxoFilter> utxoFilters, Map<Sha256Hash, BlockTransaction> walletTransactions, Map<BlockTransactionHashIndex, WalletNode> walletTxos, double feeRate, double longTermFeeRate, boolean groupByAddress, boolean includeSpentMempoolOutputs) {
+    private void getGroupedUtxos(List<OutputGroup> outputGroups, WalletNode purposeNode, List<TxoFilter> txoFilters, Map<Sha256Hash, BlockTransaction> walletTransactions, Map<BlockTransactionHashIndex, WalletNode> walletTxos, double feeRate, double longTermFeeRate, boolean groupByAddress) {
         int inputWeightUnits = getInputWeightUnits();
         for(WalletNode addressNode : purposeNode.getChildren()) {
             OutputGroup outputGroup = null;
-            for(BlockTransactionHashIndex utxo : addressNode.getUnspentTransactionOutputs(includeSpentMempoolOutputs)) {
-                Optional<UtxoFilter> matchedFilter = utxoFilters.stream().filter(utxoFilter -> !utxoFilter.isEligible(utxo)).findAny();
-                if(matchedFilter.isPresent()) {
-                    continue;
-                }
-
+            for(BlockTransactionHashIndex utxo : addressNode.getTransactionOutputs(txoFilters)) {
                 if(outputGroup == null || !groupByAddress) {
                     outputGroup = new OutputGroup(addressNode.getWallet().getScriptType(), getStoredBlockHeight(), inputWeightUnits, feeRate, longTermFeeRate);
                     outputGroups.add(outputGroup);
@@ -1323,12 +1328,12 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
      * @param feeRate the fee rate in sats/vB
      * @return the maximum spendable amount (can be negative if the fee is higher than the combined UTXO value)
      */
-    public long getMaxSpendable(List<Address> paymentAddresses, double feeRate, boolean includeSpentMempoolOutputs) {
+    public long getMaxSpendable(List<Address> paymentAddresses, double feeRate, Map<BlockTransactionHashIndex, WalletNode> availableTxos) {
         long maxInputValue = 0;
 
         Map<Wallet, Integer> cachedInputWeightUnits = new HashMap<>();
         Transaction transaction = new Transaction();
-        for(Map.Entry<BlockTransactionHashIndex, WalletNode> utxo : getWalletUtxos(includeSpentMempoolOutputs).entrySet()) {
+        for(Map.Entry<BlockTransactionHashIndex, WalletNode> utxo : availableTxos.entrySet()) {
             int inputWeightUnits = cachedInputWeightUnits.computeIfAbsent(utxo.getValue().getWallet(), Wallet::getInputWeightUnits);
             long minInputValue = (long)Math.ceil(feeRate * inputWeightUnits / WITNESS_SCALE_FACTOR);
             if(utxo.getKey().getValue() > minInputValue) {
@@ -1479,6 +1484,41 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
         }
 
         return signingNodes;
+    }
+
+    public List<Keystore> getSigningKeystores(PSBT psbt) {
+        List<Keystore> signingKeystores = new ArrayList<>();
+
+        for(Map.Entry<ExtendedKey, KeyDerivation> entry : psbt.getExtendedPublicKeys().entrySet()) {
+            for(Keystore keystore : getKeystores()) {
+                if(entry.getKey().equals(keystore.getExtendedPublicKey()) && entry.getValue().equals(keystore.getKeyDerivation())) {
+                    signingKeystores.add(keystore);
+                }
+            }
+        }
+
+        return signingKeystores;
+    }
+
+    public Integer getRequiredGapLimit(PSBT psbt) {
+        Wallet copy = this.copy();
+        for(KeyPurpose keyPurpose : KeyPurpose.DEFAULT_PURPOSES) {
+            WalletNode purposeNode = copy.getNode(keyPurpose);
+            purposeNode.fillToIndex(purposeNode.getChildren().size() + SEARCH_LOOKAHEAD);
+        }
+        Map<PSBTInput, WalletNode> copySigningNodes = copy.getSigningNodes(psbt);
+        boolean found = false;
+        int gapLimit = getGapLimit();
+        for(KeyPurpose keyPurpose : KeyPurpose.DEFAULT_PURPOSES) {
+            OptionalInt optHighestIndex = copySigningNodes.values().stream().filter(node -> node.getKeyPurpose() == keyPurpose).mapToInt(WalletNode::getIndex).max();
+            if(optHighestIndex.isPresent()) {
+                found = true;
+                Integer highestUsedIndex = getNode(keyPurpose).getHighestUsedIndex();
+                gapLimit = Math.max(gapLimit, optHighestIndex.getAsInt() - (highestUsedIndex == null ? -1 : highestUsedIndex));
+            }
+        }
+
+        return found ? gapLimit : null;
     }
 
     /**
@@ -1660,6 +1700,10 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
                         labels.put(output.getHash().toString() + "<" + output.getIndex(), output.getLabel());
                     }
 
+                    if(output.getStatus() != null) {
+                        labels.put(output.getHash().toString() + ":" + output.getIndex(), output.getStatus().toString());
+                    }
+
                     if(output.isSpent() && output.getSpentBy().getLabel() != null && !output.getSpentBy().getLabel().isEmpty()) {
                         labels.put(output.getSpentBy().getHash() + ">" + output.getSpentBy().getIndex(), output.getSpentBy().getLabel());
                     }
@@ -1730,6 +1774,10 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
             if(derivationMatchesAnotherScriptType(keystore.getKeyDerivation().getDerivationPath())) {
                 throw new InvalidWalletException("Keystore " + keystore.getLabel() + " derivation of " + keystore.getKeyDerivation().getDerivationPath() + " in " + scriptType.getName() + " wallet matches another default script type.");
             }
+
+            if(derivationMatchesAnotherNetwork(keystore.getKeyDerivation().getDerivationPath())) {
+                throw new InvalidWalletException("Keystore " + keystore.getLabel() + " derivation of " + keystore.getKeyDerivation().getDerivationPath() + " in " + scriptType.getName() + " wallet matches another network.");
+            }
         }
 
         if(containsDuplicateExtendedKeys()) {
@@ -1746,7 +1794,19 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
             return false;
         }
 
-        return Arrays.stream(ScriptType.values()).anyMatch(scriptType -> !scriptType.equals(this.scriptType) && scriptType.getAccount(derivationPath) > -1);
+        return Arrays.stream(ScriptType.values()).anyMatch(scriptType -> !scriptType.equals(this.scriptType) && scriptType.getAccount(derivationPath, true) > -1);
+    }
+
+    public boolean derivationMatchesAnotherNetwork(String derivationPath) {
+        if(Boolean.TRUE.toString().equals(System.getProperty(ALLOW_DERIVATIONS_MATCHING_OTHER_NETWORKS_PROPERTY))) {
+            return false;
+        }
+
+        if(scriptType != null && scriptType.getAccount(derivationPath, true) > -1) {
+            return ScriptType.derivationMatchesAnotherNetwork(derivationPath);
+        }
+
+        return false;
     }
 
     public boolean containsDuplicateKeystoreLabels() {
@@ -1766,7 +1826,10 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
     }
 
     public void makeLabelsUnique(Keystore newKeystore) {
-        makeLabelsUnique(newKeystore, false);
+        Set<String> labels = getKeystores().stream().map(Keystore::getBaseLabel).collect(Collectors.toSet());
+        if(!labels.add(newKeystore.getBaseLabel())) {
+            makeLabelsUnique(newKeystore, false);
+        }
     }
 
     private int makeLabelsUnique(Keystore newKeystore, boolean duplicateFound) {
@@ -1793,6 +1856,8 @@ public class Wallet extends Persistable implements Comparable<Wallet> {
             max++;
             if(newKeystore.getLabel().equals(Keystore.DEFAULT_LABEL)) {
                 newKeystore.setLabel(Keystore.DEFAULT_LABEL.substring(0, Keystore.DEFAULT_LABEL.length() - 2) + " " + max);
+            } else if(newKeystore.getLabel().length() + Integer.toString(max).length() + 1 > Keystore.MAX_LABEL_LENGTH) {
+                newKeystore.setLabel(newKeystore.getLabel().substring(0, Keystore.MAX_LABEL_LENGTH - (Integer.toString(max).length() + 1)) + " " + max);
             } else {
                 newKeystore.setLabel(newKeystore.getLabel() + " " + max);
             }

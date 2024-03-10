@@ -11,6 +11,7 @@ import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.stream.IntStream;
 
 import static com.sparrowwallet.drongo.protocol.ScriptOpCodes.*;
 
@@ -145,24 +146,27 @@ public class ScriptChunk {
     }
 
     public boolean isScript() {
-        if(data == null || data.length == 0) {
+        //Do not attempt to parse long data byte arrays into scripts
+        if(data == null || data.length == 0 || data.length > 1000) {
             return false;
         }
 
-        if(isSignature() || isPubKey()) {
+        if(isSignature() || isPubKey() || isTaprootControlBlock()) {
             return false;
         }
 
+        Script script = new Script(data, false);
         try {
-            Script script = new Script(data);
-            //Flaky: Test if contains a non-zero opcode, otherwise not a script
-            for(ScriptChunk chunk : script.getChunks()) {
-                if(chunk.getOpcode() != OP_0) {
-                    return true;
-                }
-            }
-        } catch(ProtocolException e) {
+            script.parse();
+        } catch (ProtocolException e) {
             return false;
+        }
+
+        //Flaky: Test if contains a non-zero opcode, otherwise not a script
+        for(ScriptChunk chunk : script.getChunks()) {
+            if(chunk.getOpcode() != OP_0) {
+                return true;
+            }
         }
 
         return false;
@@ -177,11 +181,20 @@ public class ScriptChunk {
             return false;
         }
 
-        return ECKey.isPubKeyCanonical(data);
+        return ECKey.isPubKeyCanonical(data) && !IntStream.range(0, data.length).mapToObj(i -> data[i]).allMatch(b -> b == 0);
     }
 
     public ECKey getPubKey() {
         return ECKey.fromPublicOnly(data);
+    }
+
+    public boolean isTaprootControlBlock() {
+        if(data == null || data.length == 0 || (data.length - 1) % 32 != 0) {
+            return false;
+        }
+
+        //Test for BIP341 leaf version and both parity options
+        return ((data[0] & 0xff) == 0xc0 || (data[0] & 0xff) == 0xc1);
     }
 
     public byte[] toByteArray() {

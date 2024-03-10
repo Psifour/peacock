@@ -33,9 +33,15 @@ public class OutputDescriptor {
     private final int multisigThreshold;
     private final Map<ExtendedKey, KeyDerivation> extendedPublicKeys;
     private final Map<ExtendedKey, String> mapChildrenDerivations;
+    private final Map<ExtendedKey, String> mapExtendedPublicKeyLabels;
+    private final Map<ExtendedKey, ExtendedKey> extendedMasterPrivateKeys;
 
     public OutputDescriptor(ScriptType scriptType, ExtendedKey extendedPublicKey, KeyDerivation keyDerivation) {
         this(scriptType, Collections.singletonMap(extendedPublicKey, keyDerivation));
+    }
+
+    public OutputDescriptor(ScriptType scriptType, ExtendedKey extendedPublicKey, KeyDerivation keyDerivation, String extendedPublicKeyLabel) {
+        this(scriptType, 0, Collections.singletonMap(extendedPublicKey, keyDerivation), new LinkedHashMap<>(), extendedPublicKeyLabel == null ? new LinkedHashMap<>() : Collections.singletonMap(extendedPublicKey, extendedPublicKeyLabel));
     }
 
     public OutputDescriptor(ScriptType scriptType, Map<ExtendedKey, KeyDerivation> extendedPublicKeys) {
@@ -47,10 +53,20 @@ public class OutputDescriptor {
     }
 
     public OutputDescriptor(ScriptType scriptType, int multisigThreshold, Map<ExtendedKey, KeyDerivation> extendedPublicKeys, Map<ExtendedKey, String> mapChildrenDerivations) {
+        this(scriptType, multisigThreshold, extendedPublicKeys, mapChildrenDerivations, new LinkedHashMap<>());
+    }
+
+    public OutputDescriptor(ScriptType scriptType, int multisigThreshold, Map<ExtendedKey, KeyDerivation> extendedPublicKeys, Map<ExtendedKey, String> mapChildrenDerivations, Map<ExtendedKey, String> mapExtendedPublicKeyLabels) {
+        this(scriptType, multisigThreshold, extendedPublicKeys, mapChildrenDerivations, mapExtendedPublicKeyLabels, new LinkedHashMap<>());
+    }
+
+    public OutputDescriptor(ScriptType scriptType, int multisigThreshold, Map<ExtendedKey, KeyDerivation> extendedPublicKeys, Map<ExtendedKey, String> mapChildrenDerivations, Map<ExtendedKey, String> mapExtendedPublicKeyLabels, Map<ExtendedKey, ExtendedKey> extendedMasterPrivateKeys) {
         this.scriptType = scriptType;
         this.multisigThreshold = multisigThreshold;
         this.extendedPublicKeys = extendedPublicKeys;
         this.mapChildrenDerivations = mapChildrenDerivations;
+        this.mapExtendedPublicKeyLabels = mapExtendedPublicKeyLabels;
+        this.extendedMasterPrivateKeys = extendedMasterPrivateKeys;
     }
 
     public Set<ExtendedKey> getExtendedPublicKeys() {
@@ -67,6 +83,10 @@ public class OutputDescriptor {
 
     public String getChildDerivationPath(ExtendedKey extendedPublicKey) {
         return mapChildrenDerivations.get(extendedPublicKey);
+    }
+
+    public String getExtendedPublicKeyLabel(ExtendedKey extendedPublicKey) {
+        return mapExtendedPublicKeyLabels.get(extendedPublicKey);
     }
 
     public boolean describesMultipleAddresses(ExtendedKey extendedPublicKey) {
@@ -241,11 +261,27 @@ public class OutputDescriptor {
         wallet.setScriptType(scriptType);
 
         for(Map.Entry<ExtendedKey,KeyDerivation> extKeyEntry : extendedPublicKeys.entrySet()) {
+            ExtendedKey xpub = extKeyEntry.getKey();
             Keystore keystore = new Keystore();
-            keystore.setSource(KeystoreSource.SW_WATCH);
-            keystore.setWalletModel(WalletModel.SPARROW);
-            keystore.setKeyDerivation(extKeyEntry.getValue());
-            keystore.setExtendedPublicKey(extKeyEntry.getKey());
+            if(extendedMasterPrivateKeys.containsKey(xpub)) {
+                ExtendedKey xprv = extendedMasterPrivateKeys.get(xpub);
+                MasterPrivateExtendedKey masterPrivateExtendedKey = new MasterPrivateExtendedKey(xprv.getKey().getPrivKeyBytes(), xprv.getKey().getChainCode());
+                String childDerivation = mapChildrenDerivations.get(xpub) == null ? scriptType.getDefaultDerivationPath() : mapChildrenDerivations.get(xpub);
+                if(childDerivation.endsWith("/0/*") || childDerivation.endsWith("/1/*")) {
+                    childDerivation = childDerivation.substring(0, childDerivation.length() - 4);
+                }
+                try {
+                    keystore = Keystore.fromMasterPrivateExtendedKey(masterPrivateExtendedKey, KeyDerivation.parsePath(childDerivation));
+                } catch(MnemonicException e) {
+                    throw new RuntimeException(e);
+                }
+            } else {
+                keystore.setSource(KeystoreSource.SW_WATCH);
+                keystore.setWalletModel(WalletModel.SPARROW);
+                keystore.setKeyDerivation(extKeyEntry.getValue());
+                keystore.setExtendedPublicKey(xpub);
+            }
+            setKeystoreLabel(keystore);
             wallet.makeLabelsUnique(keystore);
             wallet.getKeystores().add(keystore);
         }
@@ -269,10 +305,21 @@ public class OutputDescriptor {
         Keystore keystore = new Keystore();
         keystore.setKeyDerivation(new KeyDerivation(masterFingerprint, KeyDerivation.writePath(getKeyDerivation(extendedKey).getDerivation())));
         keystore.setExtendedPublicKey(extendedKey);
+        setKeystoreLabel(keystore);
         wallet.getKeystores().add(keystore);
         wallet.setDefaultPolicy(Policy.getPolicy(isCosigner() ? PolicyType.MULTI : PolicyType.SINGLE, wallet.getScriptType(), wallet.getKeystores(), 1));
 
         return wallet;
+    }
+
+    public void setKeystoreLabel(Keystore keystore) {
+        if(keystore.getExtendedPublicKey() != null && mapExtendedPublicKeyLabels.get(keystore.getExtendedPublicKey()) != null) {
+            String label = mapExtendedPublicKeyLabels.get(keystore.getExtendedPublicKey()).trim();
+            if(label.length() > Keystore.MAX_LABEL_LENGTH) {
+                label = label.substring(0, Keystore.MAX_LABEL_LENGTH);
+            }
+            keystore.setLabel(label);
+        }
     }
 
     public static String toDescriptorString(Address address) {
@@ -315,6 +362,10 @@ public class OutputDescriptor {
 
     // See https://github.com/bitcoin/bitcoin/blob/master/doc/descriptors.md
     public static OutputDescriptor getOutputDescriptor(String descriptor) {
+        return getOutputDescriptor(descriptor, new LinkedHashMap<>());
+    }
+
+    public static OutputDescriptor getOutputDescriptor(String descriptor, Map<ExtendedKey, String> mapExtendedPublicKeyLabels) {
         ScriptType scriptType = ScriptType.fromDescriptor(descriptor);
         if(scriptType == null) {
             ExtendedKey.Header header = ExtendedKey.Header.fromExtendedKey(descriptor);
@@ -326,7 +377,7 @@ public class OutputDescriptor {
         }
 
         int threshold = getMultisigThreshold(descriptor);
-        return getOutputDescriptorImpl(scriptType, threshold, descriptor);
+        return getOutputDescriptorImpl(scriptType, threshold, descriptor, mapExtendedPublicKeyLabels);
     }
 
     private static int getMultisigThreshold(String descriptor) {
@@ -339,7 +390,7 @@ public class OutputDescriptor {
         }
     }
 
-    private static OutputDescriptor getOutputDescriptorImpl(ScriptType scriptType, int multisigThreshold, String descriptor) {
+    private static OutputDescriptor getOutputDescriptorImpl(ScriptType scriptType, int multisigThreshold, String descriptor, Map<ExtendedKey, String> mapExtendedPublicKeyLabels) {
         Matcher checksumMatcher = CHECKSUM_PATTERN.matcher(descriptor);
         if(checksumMatcher.find()) {
             String checksum = checksumMatcher.group(1);
@@ -351,11 +402,12 @@ public class OutputDescriptor {
 
         Map<ExtendedKey, KeyDerivation> keyDerivationMap = new LinkedHashMap<>();
         Map<ExtendedKey, String> keyChildDerivationMap = new LinkedHashMap<>();
+        Map<ExtendedKey, ExtendedKey> masterPrivateKeyMap = new LinkedHashMap<>();
         Matcher matcher = XPUB_PATTERN.matcher(descriptor);
         while(matcher.find()) {
             String masterFingerprint = null;
             String keyDerivationPath = null;
-            String extPubKey;
+            String extKey;
             String childDerivationPath = null;
 
             if(matcher.group(1) != null) {
@@ -371,23 +423,28 @@ public class OutputDescriptor {
                 }
             }
 
-            extPubKey = matcher.group(2);
+            extKey = matcher.group(2);
             if(matcher.group(3) != null) {
                 childDerivationPath = matcher.group(3);
             }
 
             KeyDerivation keyDerivation = new KeyDerivation(masterFingerprint, keyDerivationPath);
             try {
-                ExtendedKey extendedPublicKey = ExtendedKey.fromDescriptor(extPubKey);
-                if(extendedPublicKey.getKey().hasPrivKey()) {
+                ExtendedKey extendedKey = ExtendedKey.fromDescriptor(extKey);
+                if(extendedKey.getKey().hasPrivKey()) {
+                    ExtendedKey privateExtendedKey = extendedKey;
                     List<ChildNumber> derivation = keyDerivation.getDerivation();
                     int depth = derivation.size() == 0 ? scriptType.getDefaultDerivation().size() : derivation.size();
-                    DeterministicKey prvKey = extendedPublicKey.getKey();
-                    DeterministicKey pubKey = new DeterministicKey(prvKey.getPath(), prvKey.getChainCode(), prvKey.getPubKey(), depth, extendedPublicKey.getParentFingerprint());
-                    extendedPublicKey = new ExtendedKey(pubKey, pubKey.getParentFingerprint(), extendedPublicKey.getKeyChildNumber());
+                    DeterministicKey prvKey = extendedKey.getKey();
+                    DeterministicKey pubKey = new DeterministicKey(prvKey.getPath(), prvKey.getChainCode(), prvKey.getPubKey(), depth, extendedKey.getParentFingerprint());
+                    extendedKey = new ExtendedKey(pubKey, pubKey.getParentFingerprint(), extendedKey.getKeyChildNumber());
+
+                    if(derivation.size() == 0) {
+                        masterPrivateKeyMap.put(extendedKey, privateExtendedKey);
+                    }
                 }
-                keyDerivationMap.put(extendedPublicKey, keyDerivation);
-                keyChildDerivationMap.put(extendedPublicKey, childDerivationPath);
+                keyDerivationMap.put(extendedKey, keyDerivation);
+                keyChildDerivationMap.put(extendedKey, childDerivationPath);
             } catch(ProtocolException e) {
                 throw new ProtocolException("Invalid xpub: " + e.getMessage());
             }
@@ -400,7 +457,7 @@ public class OutputDescriptor {
             }
         }
 
-        return new OutputDescriptor(scriptType, multisigThreshold, keyDerivationMap, keyChildDerivationMap);
+        return new OutputDescriptor(scriptType, multisigThreshold, keyDerivationMap, keyChildDerivationMap, mapExtendedPublicKeyLabels, masterPrivateKeyMap);
     }
 
     public static String normalize(String descriptor) {
@@ -560,8 +617,13 @@ public class OutputDescriptor {
     }
 
     private String toString(ExtendedKey pubKey, boolean addKeyOrigin, boolean addKey) {
-        StringBuilder keyBuilder = new StringBuilder();
         KeyDerivation keyDerivation = extendedPublicKeys.get(pubKey);
+        String childDerivation = mapChildrenDerivations.get(pubKey);
+        return writeKey(pubKey, keyDerivation, childDerivation, addKeyOrigin, addKey);
+    }
+
+    public static String writeKey(ExtendedKey pubKey, KeyDerivation keyDerivation, String childDerivation, boolean addKeyOrigin, boolean addKey) {
+        StringBuilder keyBuilder = new StringBuilder();
         if(keyDerivation != null && keyDerivation.getDerivationPath() != null && addKeyOrigin) {
             keyBuilder.append("[");
             if(keyDerivation.getMasterFingerprint() != null) {
@@ -577,7 +639,6 @@ public class OutputDescriptor {
                 keyBuilder.append(pubKey.toString());
             }
 
-            String childDerivation = mapChildrenDerivations.get(pubKey);
             if(childDerivation != null) {
                 if(!childDerivation.startsWith("/")) {
                     keyBuilder.append("/");

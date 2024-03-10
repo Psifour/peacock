@@ -8,8 +8,6 @@ import com.sparrowwallet.drongo.crypto.ChildNumber;
 import com.sparrowwallet.drongo.crypto.ECKey;
 import com.sparrowwallet.drongo.policy.PolicyType;
 
-import java.time.LocalDate;
-import java.time.Month;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -1174,10 +1172,31 @@ public enum ScriptType {
         return Collections.unmodifiableList(copy);
     }
 
+    public static boolean derivationMatchesAnotherNetwork(String derivationPath) {
+        if(KeyDerivation.isValid(derivationPath)) {
+            List<ChildNumber> derivation = new ArrayList<>(KeyDerivation.parsePath(derivationPath));
+            if(derivation.size() > 1) {
+                int networkIndex = derivation.get(1).num();
+                return Network.get() == Network.MAINNET ? (networkIndex == 1) : (networkIndex == 0);
+            }
+        }
+
+        return false;
+    }
+
     public int getAccount(String derivationPath) {
+        return getAccount(derivationPath, false);
+    }
+
+    public int getAccount(String derivationPath, boolean ignoreNetwork) {
         if(KeyDerivation.isValid(derivationPath)) {
             List<ChildNumber> derivation = new ArrayList<>(KeyDerivation.parsePath(derivationPath));
             if(derivation.size() > 2) {
+                if(ignoreNetwork) {
+                    ChildNumber networkChildNumber = new ChildNumber(Network.get() == Network.MAINNET ? 0 : 1, true);
+                    derivation.set(1, networkChildNumber);
+                }
+
                 int account = derivation.get(2).num();
                 List<ChildNumber> defaultDerivation = getDefaultDerivation(account);
                 if(defaultDerivation.equals(derivation)) {
@@ -1320,7 +1339,7 @@ public enum ScriptType {
         //Start with length of output
         int outputVbytes = output.getLength();
         //Add length of spending input (with or without discount depending on script type)
-        int inputVbytes = getInputVbytes();
+        double inputVbytes = getInputVbytes();
 
         //Return fee rate in sats/vByte multiplied by the calculated output and input vByte lengths
         return (long)(feeRate * outputVbytes + longTermFeeRate * inputVbytes);
@@ -1333,17 +1352,17 @@ public enum ScriptType {
      *
      * @return The number of vBytes required for an input of this script type
      */
-    public int getInputVbytes() {
+    public double getInputVbytes() {
         if(P2SH_P2WPKH.equals(this)) {
-            return (32 + 4 + 1 + 13 + (107 / WITNESS_SCALE_FACTOR) + 4);
+            return (32 + 4 + 1 + 13 + ((double)107 / WITNESS_SCALE_FACTOR) + 4);
         } else if(P2SH_P2WSH.equals(this)) {
-            return (32 + 4 + 1 + 35 + (107 / WITNESS_SCALE_FACTOR) + 4);
+            return (32 + 4 + 1 + 35 + ((double)107 / WITNESS_SCALE_FACTOR) + 4);
         } else if(P2TR.equals(this)) {
             //Assume a default keypath spend
-            return (32 + 4 + 1 + (66 / WITNESS_SCALE_FACTOR) + 4);
+            return (32 + 4 + 1 + ((double)66 / WITNESS_SCALE_FACTOR) + 4);
         } else if(Arrays.asList(WITNESS_TYPES).contains(this)) {
             //Return length of spending input with 75% discount to script size
-            return (32 + 4 + 1 + (107 / WITNESS_SCALE_FACTOR) + 4);
+            return (32 + 4 + 1 + ((double)107 / WITNESS_SCALE_FACTOR) + 4);
         } else if(Arrays.asList(NON_WITNESS_TYPES).contains(this)) {
             //Return length of spending input with no discount
             return (32 + 4 + 1 + 107 + 4);

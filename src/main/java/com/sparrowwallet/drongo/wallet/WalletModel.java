@@ -4,14 +4,15 @@ import java.util.Locale;
 
 public enum WalletModel {
     SEED, SPARROW, BITCOIN_CORE, ELECTRUM, TREZOR_1, TREZOR_T, COLDCARD, LEDGER_NANO_S, LEDGER_NANO_X, DIGITALBITBOX_01, KEEPKEY, SPECTER_DESKTOP, COBO_VAULT,
-    BITBOX_02, SPECTER_DIY, PASSPORT, BLUE_WALLET, KEYSTONE, SEEDSIGNER, CARAVAN, GORDIAN_SEED_TOOL, JADE, LEDGER_NANO_S_PLUS, EPS, TAPSIGNER, SATSCARD, LABELS, BSMS;
+    BITBOX_02, SPECTER_DIY, PASSPORT, BLUE_WALLET, KEYSTONE, SEEDSIGNER, CARAVAN, GORDIAN_SEED_TOOL, JADE, LEDGER_NANO_S_PLUS, EPS, TAPSIGNER, SATSCARD, LABELS,
+    BSMS, KRUX, SATOCHIP, TRANSACTIONS, AIRGAP_VAULT, TREZOR_SAFE_3, SATSCHIP;
 
     public static WalletModel getModel(String model) {
         return valueOf(model.toUpperCase(Locale.ROOT));
     }
 
     public String getType() {
-        if(this == TREZOR_1 || this == TREZOR_T) {
+        if(this == TREZOR_1 || this == TREZOR_T || this == TREZOR_SAFE_3) {
             return "trezor";
         }
 
@@ -47,11 +48,15 @@ public enum WalletModel {
             return "seedtool";
         }
 
+        if(this == AIRGAP_VAULT) {
+            return "airgapvault";
+        }
+
         return this.toString().toLowerCase(Locale.ROOT);
     }
 
     public boolean alwaysIncludeNonWitnessUtxo() {
-        if(this == COLDCARD || this == COBO_VAULT || this == PASSPORT || this == KEYSTONE || this == GORDIAN_SEED_TOOL || this == SEEDSIGNER) {
+        if(this == COLDCARD || this == COBO_VAULT || this == PASSPORT || this == KEYSTONE || this == GORDIAN_SEED_TOOL || this == SEEDSIGNER || this == KRUX) {
             return false;
         }
 
@@ -67,7 +72,47 @@ public enum WalletModel {
     }
 
     public boolean isCard() {
-        return (this == TAPSIGNER || this == SATSCARD);
+        return (this == TAPSIGNER || this == SATSCHIP || this == SATSCARD || this == SATOCHIP);
+    }
+
+    public int getMinPinLength() {
+        if(this == SATOCHIP) {
+            return 4;
+        } else {
+            return 6;
+        }
+    }
+
+    public int getMaxPinLength() {
+        if(this == SATOCHIP) {
+            return 16;
+        } else {
+            return 32;
+        }
+    }
+
+    public boolean hasDefaultPin() {
+        if(this == SATOCHIP) {
+            return false;
+        } else {
+            return true;
+        }
+    }
+
+    public boolean requiresSeedInitialization() {
+        if(this == SATOCHIP) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    public boolean supportsBackup() {
+        if(this == SATOCHIP || this == SATSCHIP) {
+            return false;
+        } else {
+            return true;
+        }
     }
 
     public static WalletModel fromType(String type) {
